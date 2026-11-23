@@ -1,0 +1,59 @@
+name: 01 - Initial Training (Model A)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  train-model-a:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Generate datasets and run tests
+        run: |
+          python -m data.generate_data
+          python -m pytest -v tests/test_pipeline.py
+
+      - name: Train Model A
+        run: |
+          mkdir -p artifacts
+          python -m app.train \
+            --train data/train_A.csv \
+            --model artifacts/model.joblib \
+            --metrics artifacts/train_A_metrics.json \
+            --version Model-A
+
+      - name: Evaluate Model A on Test A
+        run: |
+          python -m app.predict \
+            --model artifacts/model.joblib \
+            --data data/test_A.csv \
+            --metrics artifacts/eval_A_metrics.json
+
+      - name: Run Quality Gate for Model A (Threshold 0.80)
+        env:
+          MODEL_METRICS_FILE: artifacts/eval_A_metrics.json
+          ACCURACY_THRESHOLD: "0.80"
+          F1_THRESHOLD: "0.80"
+        run: python scripts/quality_gate.py
+
+      - name: Publish Model A as deployed-model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployed-model
+          path: |
+            artifacts/model.joblib
+            artifacts/eval_A_metrics.json

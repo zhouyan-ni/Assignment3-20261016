@@ -1,0 +1,86 @@
+name: 03 - Retraining and Redeployment (Model B)
+
+on:
+  workflow_dispatch:
+    inputs:
+      drift_confirmed:
+        description: 'Triggered automatically by Pipeline 2 upon drift detection'
+        required: true
+        default: 'false'
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  retrain-model-b:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify drift monitoring result from Pipeline 2
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p artifacts
+          ARTIFACT_ID=$(gh api repos/${{ github.repository }}/actions/artifacts \
+            --jq '[.artifacts[] | select(.name=="drift-monitoring-report" and .expired==false)] | sort_by(.created_at) | reverse | .[0].id')
+          gh api repos/${{ github.repository }}/actions/artifacts/$ARTIFACT_ID/zip > drift-report.zip
+          unzip -o drift-report.zip -d artifacts/
+          cat artifacts/drift_report.json
+          python -c "
+          import json, sys
+          with open('artifacts/drift_report.json') as f:
+              r = json.load(f)
+          if not r.get('drift_detected', False):
+              print('ERROR: Drift was NOT detected. Aborting retraining.')
+              sys.exit(1)
+          print('Verified: Drift confirmed by monitoring report.')
+          "
+
+      - name: Prepare updated training data and run tests
+        run: |
+          python -m data.generate_data
+          python -m pytest -v tests/test_pipeline.py
+
+      - name: Train Model B on updated dataset (train_AB.csv)
+        run: |
+          python -m app.train \
+            --train data/train_AB.csv \
+            --model artifacts/model.joblib \
+            --metrics artifacts/train_B_metrics.json \
+            --version Model-B
+
+      - name: Evaluate Model B on independent Test C (test_C.csv)
+        run: |
+          python -m app.predict \
+            --model artifacts/model.joblib \
+            --data data/test_C.csv \
+            --metrics artifacts/eval_B_metrics.json
+
+      - name: Run Quality Gate for Model B (Threshold 0.70)
+        env:
+          MODEL_METRICS_FILE: artifacts/eval_B_metrics.json
+          ACCURACY_THRESHOLD: "0.70"
+          F1_THRESHOLD: "0.70"
+        run: python scripts/quality_gate.py
+
+      - name: Publish Model B as new deployed-model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployed-model
+          path: |
+            artifacts/model.joblib
+            artifacts/eval_B_metrics.json

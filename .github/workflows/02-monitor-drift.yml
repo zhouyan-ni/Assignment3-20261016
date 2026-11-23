@@ -1,0 +1,100 @@
+name: 02 - Monitoring and Drift Detection
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: 'Select production data scenario'
+        required: true
+        default: 'normal'
+        type: choice
+        options:
+          - normal
+          - drift
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  monitor-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download latest deployed-model artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p artifacts
+          ARTIFACT_ID=$(gh api repos/${{ github.repository }}/actions/artifacts \
+            --jq '[.artifacts[] | select(.name=="deployed-model" and .expired==false)] | sort_by(.created_at) | reverse | .[0].id')
+          echo "Downloading latest deployed-model artifact ID: $ARTIFACT_ID"
+          gh api repos/${{ github.repository }}/actions/artifacts/$ARTIFACT_ID/zip > deployed-model.zip
+          unzip -o deployed-model.zip -d artifacts/
+
+      - name: Generate production data
+        run: python -m data.generate_data
+
+      - name: Evaluate model on production data (${{ github.event.inputs.scenario }})
+        run: |
+          if [ "${{ github.event.inputs.scenario }}" == "normal" ]; then
+            DATA_FILE="data/test_A.csv"
+          else
+            DATA_FILE="data/test_B.csv"
+          fi
+          echo "Evaluating deployed model on $DATA_FILE..."
+          python -m app.predict \
+            --model artifacts/model.joblib \
+            --data "$DATA_FILE" \
+            --metrics artifacts/monitor_metrics.json
+
+      - name: Run drift detection (scripts/check_drift.py)
+        id: drift_check
+        env:
+          METRICS_FILE: artifacts/monitor_metrics.json
+          BASELINE_ACCURACY: "0.892"
+          ALLOWED_ACCURACY_DROP: "0.10"
+        run: |
+          set +e
+          python scripts/check_drift.py
+          EXIT_CODE=$?
+          set -e
+
+          if [ $EXIT_CODE -eq 10 ]; then
+            echo "drift_detected=true" >> "$GITHUB_OUTPUT"
+            echo '{"scenario": "${{ github.event.inputs.scenario }}", "drift_detected": true, "status": "DRIFT DETECTED"}' > artifacts/drift_report.json
+          elif [ $EXIT_CODE -eq 0 ]; then
+            echo "drift_detected=false" >> "$GITHUB_OUTPUT"
+            echo '{"scenario": "${{ github.event.inputs.scenario }}", "drift_detected": false, "status": "NO DRIFT"}' > artifacts/drift_report.json
+          else
+            echo "Unexpected error in check_drift.py (exit code: $EXIT_CODE)"
+            exit $EXIT_CODE
+          fi
+
+      - name: Upload drift monitoring report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-monitoring-report
+          path: |
+            artifacts/drift_report.json
+            artifacts/monitor_metrics.json
+
+      - name: Trigger Pipeline 3 when drift is detected
+        if: steps.drift_check.outputs.drift_detected == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Drift detected! Automatically triggering Pipeline 3 (03-retrain-model.yml)..."
+          gh workflow run 03-retrain-model.yml --ref main -f drift_confirmed=true
